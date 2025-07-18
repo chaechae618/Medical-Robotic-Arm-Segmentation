@@ -1,0 +1,323 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DataParallel
+from torchvision import transforms
+from PIL import Image
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from transformers import SegformerForSemanticSegmentation, SegformerConfig
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import json
+from pathlib import Path
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+def match_image_mask_pairs(original_root, mask_root):
+    """원본 이미지와 마스크 파일을 매칭"""
+    print("="*60)
+    print("📊 데이터 매칭 및 수집")
+    print("="*60)
+    print(f"🔍 데이터 매칭 시작")
+    print(f"  원본 이미지: {original_root}")
+    print(f"  마스크 이미지: {mask_root}")
+    
+    image_paths = []
+    mask_paths = []
+    
+    original_root = Path(original_root)
+    mask_root = Path(mask_root)
+    
+    # 폴더 매핑 테이블
+    folder_mapping = {
+        'Fr5_intertek_1st_250526': '1st',
+        'Fr5_intertek_2nd_250526': '2nd', 
+        'Fr5_intertek_3rd_250526': '3rd',
+        'Fr5_intertek_4th_250526': '4th',
+        'Fr5_intertek_5th_250526': '5th',
+        'Fr5_intertek_6th_250526': '6th',
+        'Fr5_intertek_7th_250526': '7th'
+    }
+    
+    total_pairs = 0
+    
+    for original_folder, mask_folder in folder_mapping.items():
+        original_folder_path = original_root / original_folder
+        mask_folder_path = mask_root / mask_folder
+        
+        if not original_folder_path.exists():
+            print(f"⚠️  원본 폴더 없음: {original_folder_path}")
+            continue
+            
+        if not mask_folder_path.exists():
+            print(f"⚠️  마스크 폴더 없음: {mask_folder_path}")
+            continue
+            
+        print(f"📁 처리 중: {original_folder} → {mask_folder}")
+        
+        # left, right, top 시점별 처리
+        for view in ['left', 'right', 'top']:
+            original_view_path = original_folder_path / view
+            mask_view_path = mask_folder_path / view / 'masks'
+            
+            if not original_view_path.exists():
+                print(f"  ⚠️  원본 {view} 폴더 없음")
+                continue
+                
+            if not mask_view_path.exists():
+                print(f"  ⚠️  마스크 {view}/masks 폴더 없음: {mask_view_path}")
+                continue
+            
+            view_pairs = 0
+            unmatched_samples = []
+            
+            # 원본 이미지들 찾기
+            for img_ext in ['*.jpg', '*.jpeg', '*.JPG', '*.JPEG']:
+                for original_img_path in original_view_path.glob(img_ext):
+                    # 마스크 파일명 패턴들 시도
+                    possible_mask_names = [
+                    ]
+                    
+                    found = False
+                    for possible_name in possible_mask_names:
+                        possible_mask_path = mask_view_path / possible_name
+                        if possible_mask_path.exists():
+                            image_paths.append(str(original_img_path))
+                            mask_paths.append(str(possible_mask_path))
+                            view_pairs += 1
+                            found = True
+                            break
+                    
+                    if not found:
+                        unmatched_samples.append(original_img_path.name)
+            
+            if view_pairs > 0:
+                print(f"  ✅ {view}: {view_pairs}개 매칭 쌍")
+                total_pairs += view_pairs
+                
+                if unmatched_samples:
+                    print(f"    ⚠️  매칭 실패 ({len(unmatched_samples)}개): {unmatched_samples[:3]}")
+            else:
+                print(f"  ❌ {view}: 매칭 실패")
+    
+    print(f"\n🎉 총 {len(image_paths)}개의 이미지-마스크 쌍을 찾았습니다!")
+    return image_paths, mask_paths
+
+class RobotArmDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None, is_train=True):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+        self.is_train = is_train
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        # 원본 RGB 이미지 로드
+        image_path = self.image_paths[idx]
+        image = cv2.imread(image_path)
+        
+        if image is None:
+            raise ValueError(f"이미지 로드 실패: {image_path}")
+            
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # 마스크 이미지 로드
+        mask_path = self.mask_paths[idx]
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        
+        if mask is None:
+            raise ValueError(f"마스크 로드 실패: {mask_path}")
+        
+        # 마스크를 이진화 (0: 배경, 1: 로봇팔)
+        mask = (mask > 127).astype(np.uint8)
+        
+        # 변환 적용
+        if self.transform:
+            transformed = self.transform(image=image, mask=mask)
+            image = transformed['image']
+            mask = transformed['mask']
+        
+        return {
+            'image': image,
+            'mask': mask.long(),
+            'image_path': image_path,
+            'mask_path': mask_path
+        }    
+
+def get_train_transforms(image_size=512, augmentation_level='moderate'):
+    """
+    데이터 증강 설정
+    augmentation_level: 'light', 'moderate', 'heavy'
+    """
+    
+    if augmentation_level == 'light':
+        # 가벼운 증강 (빠른 훈련, 안정적)
+        return A.Compose([
+            A.Resize(image_size, image_size),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+    
+    elif augmentation_level == 'moderate':
+        # 중간 증강 (균형잡힌 성능, 권장)
+        return A.Compose([
+            A.Resize(image_size, image_size),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.2),
+            A.RandomRotate90(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.1, 
+                scale_limit=0.1, 
+                rotate_limit=15, 
+                p=0.5
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, 
+                contrast_limit=0.2, 
+                p=0.5
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=10, 
+                sat_shift_limit=20, 
+                val_shift_limit=10, 
+                p=0.3
+            ),
+            A.GaussNoise(var_limit=(10, 50), p=0.3),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+    
+    elif augmentation_level == 'heavy':
+        # 강한 증강 (로봇팔 특화, 더 robust한 모델)
+        return A.Compose([
+            A.Resize(image_size, image_size),
+            
+            # 기하학적 변환 (로봇팔의 다양한 자세)
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.3),
+            A.RandomRotate90(p=0.5),
+            A.Rotate(limit=30, p=0.5),  # 더 큰 회전각
+            A.ShiftScaleRotate(
+                shift_limit=0.15, 
+                scale_limit=0.15, 
+                rotate_limit=20, 
+                p=0.6
+            ),
+            
+            # 색상/조명 변환 (다양한 환경 조건)
+            A.RandomBrightnessContrast(
+                brightness_limit=0.3, 
+                contrast_limit=0.3, 
+                p=0.6
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=15, 
+                sat_shift_limit=30, 
+                val_shift_limit=15, 
+                p=0.4
+            ),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            A.CLAHE(clip_limit=2.0, p=0.3),  # 대비 개선
+            
+            # 노이즈 및 블러 (카메라 품질 시뮬레이션)
+            A.GaussNoise(var_limit=(10, 80), p=0.4),
+            A.GaussianBlur(blur_limit=3, p=0.2),
+            A.MotionBlur(blur_limit=3, p=0.2),
+            
+            # 가려짐 시뮬레이션 (실제 환경의 장애물)
+            A.CoarseDropout(
+                max_holes=3, 
+                max_height=32, 
+                max_width=32, 
+                min_holes=1, 
+                min_height=8, 
+                min_width=8, 
+                p=0.3
+            ),
+            
+            # 그림자 효과 (조명 변화) - 일부 버전에서 지원하지 않을 수 있음
+            # A.RandomShadow(
+            #     shadow_roi=(0, 0.5, 1, 1),
+            #     num_shadows_lower=1,
+            #     num_shadows_upper=2,
+            #     shadow_dimension=5,
+            #     p=0.3
+            # ),
+            
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+    
+    else:
+        raise ValueError("augmentation_level must be 'light', 'moderate', or 'heavy'")
+
+def get_val_transforms(image_size=512):
+    return A.Compose([
+        A.Resize(image_size, image_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
+
+def debug_tensor_shapes(images, masks, outputs, step_name=""):
+    """텐서 크기 디버깅용 함수"""
+    print(f"\n🔍 {step_name} 텐서 크기:")
+    print(f"  입력 이미지: {images.shape}")
+    print(f"  타겟 마스크: {masks.shape}")
+    print(f"  모델 출력: {outputs.shape}")
+    
+    if images.shape[-2:] != outputs.shape[-2:]:
+        print(f"  ⚠️ 크기 불일치 감지!")
+        print(f"    입력 크기: {images.shape[-2:]}")
+        print(f"    출력 크기: {outputs.shape[-2:]}")
+    else:
+        print(f"  ✅ 크기 일치 확인")
+    """데이터 품질 검증"""
+    print(f"\n🔍 데이터 품질 검증 (샘플 {num_samples}개)")
+    print("="*50)
+    
+    for i in range(min(num_samples, len(image_paths))):
+        img_path = image_paths[i]
+        mask_path = mask_paths[i]
+        
+        print(f"\n📋 샘플 {i+1}:")
+        print(f"  원본: {Path(img_path).name}")
+        print(f"  마스크: {Path(mask_path).name}")
+        
+        try:
+            img = cv2.imread(img_path)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            
+            if img is None:
+                print(f"  ❌ 원본 이미지 로드 실패")
+                continue
+                
+            if mask is None:
+                print(f"  ❌ 마스크 이미지 로드 실패")
+                continue
+            
+            print(f"  📏 원본 크기: {img.shape}")
+            print(f"  📏 마스크 크기: {mask.shape}")
+            
+            unique_values = np.unique(mask)
+            print(f"  🎨 마스크 픽셀값: {unique_values}")
+            
+            robot_pixels = np.sum(mask > 127)
+            total_pixels = mask.shape[0] * mask.shape[1]
+            robot_ratio = robot_pixels / total_pixels * 100
+            print(f"  🤖 로봇팔 비율: {robot_ratio:.1f}%")
+            
+            print(f"  ✅ 정상")
+            
+        except Exception as e:
+            print(f"  ❌ 오류: {e}")
