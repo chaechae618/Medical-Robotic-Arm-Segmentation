@@ -1,0 +1,402 @@
+class SegFormerForRobotArm(nn.Module):
+    def __init__(self, num_classes=2, model_name="nvidia/mit-b2"):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        # Load SegFormer model (including pretrained MiT backbone)
+        # model_name options:
+        # - nvidia/mit-b0: 3.7M params (fast, lightweight)
+        # - nvidia/mit-b1: 14M params  
+        # - nvidia/mit-b2: 25M params (recommended, balanced)
+        # - nvidia/mit-b3: 45M params (higher performance)
+        # - nvidia/mit-b4: 62M params
+        # - nvidia/mit-b5: 82M params (highest performance, slow)
+        
+        print(f"🏗️ Loading SegFormer model: {model_name}")
+        self.segformer = SegformerForSemanticSegmentation.from_pretrained(
+            model_name,
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True
+        )
+        
+        # Output model parameter count
+        total_params = sum(p.numel() for p in self.segformer.parameters())
+        trainable_params = sum(p.numel() for p in self.segformer.parameters() if p.requires_grad)
+        print(f"📊 Total parameters: {total_params:,}")
+        print(f"📊 Trainable parameters: {trainable_params:,}")
+        
+    def forward(self, pixel_values):
+        outputs = self.segformer(pixel_values=pixel_values)
+        logits = outputs.logits
+        
+        # Upsample SegFormer output to input size
+        # Input: [B, C, H, W] -> Output: [B, num_classes, H, W]
+        upsampled_logits = nn.functional.interpolate(
+            logits,
+            size=pixel_values.shape[-2:],  # (H, W)
+            mode='bilinear',
+            align_corners=False
+        )
+        
+        return upsampled_logits
+
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
+    """Train one epoch"""
+    model.train()
+    
+    running_loss = 0.0
+    running_ce_loss = 0.0
+    running_dice_loss = 0.0
+    running_iou = 0.0
+    running_dice_score = 0.0
+    running_pixel_acc = 0.0
+    
+    progress_bar = tqdm(train_loader, desc=f'Train Epoch {epoch}')
+    
+    for batch_idx, batch in enumerate(progress_bar):
+        images = batch['image'].to(device)
+        masks = batch['mask'].to(device)
+        
+        optimizer.zero_grad()
+        
+        # Model prediction
+        outputs = model(images)
+        
+        # Size check on first batch (for debugging)
+        if batch_idx == 0 and epoch == 1:
+            print(f"\n🔍 First training batch tensor sizes:")
+            print(f"  Input image: {images.shape}")
+            print(f"  Target mask: {masks.shape}")
+            print(f"  Model output: {outputs.shape}")
+            
+            if images.shape[-2:] != outputs.shape[-2:]:
+                print(f"  ⚠️ Size mismatch detected!")
+                print(f"    Input size: {images.shape[-2:]}")
+                print(f"    Output size: {outputs.shape[-2:]}")
+            else:
+                print(f"  ✅ Size match confirmed")
+        
+        # Loss calculation
+        loss, ce_loss, dice_loss = criterion(outputs, masks)
+        
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        
+        # Performance metrics calculation
+        with torch.no_grad():
+            pred_masks = torch.argmax(outputs, dim=1)
+            
+            iou = calculate_iou(pred_masks, masks).mean()
+            dice_score = calculate_dice(pred_masks, masks).mean()
+            pixel_acc = calculate_pixel_accuracy(pred_masks, masks)
+            
+            running_loss += loss.item()
+            running_ce_loss += ce_loss.item()
+            running_dice_loss += dice_loss.item()
+            running_iou += iou.item()
+            running_dice_score += dice_score.item()
+            running_pixel_acc += pixel_acc.item()
+        
+        # Progress update
+        if batch_idx % 10 == 0:
+            progress_bar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'IoU': f'{iou.item():.4f}',
+                'Dice': f'{dice_score.item():.4f}',
+                'PixelAcc': f'{pixel_acc.item():.4f}'
+            })
+    
+    num_batches = len(train_loader)
+    return {
+        'loss': running_loss / num_batches,
+        'ce_loss': running_ce_loss / num_batches,
+        'dice_loss': running_dice_loss / num_batches,
+        'iou': running_iou / num_batches,
+        'dice_score': running_dice_score / num_batches,
+        'pixel_accuracy': running_pixel_acc / num_batches
+    }
+
+def validate_epoch(model, val_loader, criterion, device, epoch):
+    """Validate one epoch"""
+    model.eval()
+    
+    running_loss = 0.0
+    running_ce_loss = 0.0
+    running_dice_loss = 0.0
+    running_iou = 0.0
+    running_dice_score = 0.0
+    running_pixel_acc = 0.0
+    
+    progress_bar = tqdm(val_loader, desc=f'Val Epoch {epoch}')
+    
+    with torch.no_grad():
+        for batch in progress_bar:
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+            
+            # Model prediction
+            outputs = model(images)
+            
+            # Loss calculation
+            loss, ce_loss, dice_loss = criterion(outputs, masks)
+            
+            # Performance metrics calculation
+            pred_masks = torch.argmax(outputs, dim=1)
+            
+            iou = calculate_iou(pred_masks, masks).mean()
+            dice_score = calculate_dice(pred_masks, masks).mean()
+            pixel_acc = calculate_pixel_accuracy(pred_masks, masks)
+            
+            running_loss += loss.item()
+            running_ce_loss += ce_loss.item()
+            running_dice_loss += dice_loss.item()
+            running_iou += iou.item()
+            running_dice_score += dice_score.item()
+            running_pixel_acc += pixel_acc.item()
+            
+            progress_bar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'IoU': f'{iou.item():.4f}',
+                'Dice': f'{dice_score.item():.4f}',
+                'PixelAcc': f'{pixel_acc.item():.4f}'
+            })
+    
+    num_batches = len(val_loader)
+    return {
+        'loss': running_loss / num_batches,
+        'ce_loss': running_ce_loss / num_batches,
+        'dice_loss': running_dice_loss / num_batches,
+        'iou': running_iou / num_batches,
+        'dice_score': running_dice_score / num_batches,
+        'pixel_accuracy': running_pixel_acc / num_batches
+    }
+
+def main():
+    # Hyperparameter settings
+    BATCH_SIZE = 8  # Adjust based on GPU memory
+    IMAGE_SIZE = 512
+    LEARNING_RATE = 1e-4
+    NUM_EPOCHS = 50
+    PATIENCE = 10  # Early stopping
+    
+    # Model size selection (performance vs speed tradeoff)
+    MODEL_VARIANTS = {
+        'small': 'nvidia/mit-b0',    # Fast, lightweight
+        'medium': 'nvidia/mit-b2',   # Recommended (balanced)
+        'large': 'nvidia/mit-b3',    # High performance
+        'xlarge': 'nvidia/mit-b4'    # Highest performance (requires more memory)
+    }
+    
+    # Augmentation level selection
+    AUGMENTATION_LEVELS = {
+        'light': 'Light augmentation (fast training)',
+        'moderate': 'Moderate augmentation (recommended)',
+        'heavy': 'Heavy augmentation (more robust model)'
+    }
+    
+    # Configuration (change as needed)
+    MODEL_SIZE = 'medium'  # 'small', 'medium', 'large', 'xlarge'
+    AUGMENTATION_LEVEL = 'moderate'  # 'light', 'moderate', 'heavy'
+    
+    print("🚀 Starting SegFormer Robot Arm Segmentation Training")
+    print("="*60)
+    print(f"🏗️ Model size: {MODEL_SIZE} ({MODEL_VARIANTS[MODEL_SIZE]})")
+    print(f"🔄 Data augmentation: {AUGMENTATION_LEVEL} ({AUGMENTATION_LEVELS[AUGMENTATION_LEVEL]})")
+    
+    # 1. Data loading and matching
+    original_images_root = '/home/ibom002/dataset'
+    mask_images_root = '/home/ibom002/dataset'
+    
+    image_paths, mask_paths = match_image_mask_pairs(
+        original_images_root, 
+        mask_images_root
+    )
+    
+    if len(image_paths) == 0:
+        print("❌ No matched data found.")
+        return
+    
+    # 2. Data quality verification
+    verify_data_quality(image_paths, mask_paths, num_samples=3)
+    
+    # 3. Train/Validation split (stratified by view)
+    # Extract view information (from paths)
+    views = []
+    for img_path in image_paths:
+        if 'left' in img_path:
+            views.append('left')
+        elif 'right' in img_path:
+            views.append('right')
+        elif 'top' in img_path:
+            views.append('top')
+        else:
+            views.append('unknown')
+    
+    train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
+        image_paths, mask_paths,
+        test_size=0.2,
+        random_state=42,
+        stratify=views
+    )
+    
+    print(f"\n📊 Data split results:")
+    print(f"  Training data: {len(train_img_paths)} samples")
+    print(f"  Validation data: {len(val_img_paths)} samples")
+    
+    # 4. Dataset and DataLoader creation
+    train_transforms = get_train_transforms(IMAGE_SIZE, AUGMENTATION_LEVEL)
+    val_transforms = get_val_transforms(IMAGE_SIZE)
+    
+    train_dataset = RobotArmDataset(
+        train_img_paths, train_mask_paths, 
+        transform=train_transforms, 
+        is_train=True
+    )
+    
+    val_dataset = RobotArmDataset(
+        val_img_paths, val_mask_paths, 
+        transform=val_transforms, 
+        is_train=False
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    print(f"\n📈 Batch information:")
+    print(f"  Training batches: {len(train_loader)}")
+    print(f"  Validation batches: {len(val_loader)}")
+    print(f"  Batch size: {BATCH_SIZE}")
+    
+    # 5. Model creation
+    print(f"\n🏗️ Creating model...")
+    model = SegFormerForRobotArm(
+        num_classes=2, 
+        model_name=MODEL_VARIANTS[MODEL_SIZE]
+    )
+    
+    # Multi-GPU usage
+    if torch.cuda.device_count() > 1:
+        print(f"🖥️ Using {torch.cuda.device_count()} GPUs")
+        model = DataParallel(model)
+    
+    model = model.to(device)
+    
+    # 6. Loss function and optimizer
+    criterion = CombinedLoss(alpha=0.7, beta=0.3)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+    
+    # 7. Variables for training history
+    train_history = []
+    val_history = []
+    best_val_iou = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    
+    print(f"\n🎯 Starting training!")
+    print(f"  Total epochs: {NUM_EPOCHS}")
+    print(f"  Learning rate: {LEARNING_RATE}")
+    print(f"  Early stopping patience: {PATIENCE} epochs")
+    
+    # 8. Training loop
+    for epoch in range(1, NUM_EPOCHS + 1):
+        start_time = time.time()
+        
+        # Training
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+        
+        # Validation
+        val_metrics = validate_epoch(model, val_loader, criterion, device, epoch)
+        
+        # Update learning rate scheduler
+        old_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(val_metrics['loss'])
+        new_lr = optimizer.param_groups[0]['lr']
+        
+        # Detect and output learning rate changes
+        if new_lr < old_lr:
+            print(f"  📉 Learning rate decreased: {old_lr:.2e} → {new_lr:.2e}")
+        
+        # Save history
+        train_history.append(train_metrics)
+        val_history.append(val_metrics)
+        
+        epoch_time = time.time() - start_time
+        
+        # Output results
+        print(f"\n📊 Epoch {epoch}/{NUM_EPOCHS} results (Time: {epoch_time:.2f}s)")
+        print(f"  Train - Loss: {train_metrics['loss']:.4f}, IoU: {train_metrics['iou']:.4f}, "
+              f"Dice: {train_metrics['dice_score']:.4f}, PixelAcc: {train_metrics['pixel_accuracy']:.4f}")
+        print(f"  Val   - Loss: {val_metrics['loss']:.4f}, IoU: {val_metrics['iou']:.4f}, "
+              f"Dice: {val_metrics['dice_score']:.4f}, PixelAcc: {val_metrics['pixel_accuracy']:.4f}")
+        
+        # Save best performance model
+        if val_metrics['iou'] > best_val_iou:
+            best_val_iou = val_metrics['iou']
+            best_epoch = epoch
+            patience_counter = 0
+            
+            # Save model
+            if isinstance(model, DataParallel):
+                model_state = model.module.state_dict()
+            else:
+                model_state = model.state_dict()
+            
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model_state,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_iou': val_metrics['iou'],
+                'val_dice': val_metrics['dice_score'],
+                'train_history': train_history,
+                'val_history': val_history
+            }, 'best_segformer_robot_arm.pth')
+            
+            print(f"  🎉 New best performance! IoU: {best_val_iou:.4f} (Epoch {epoch})")
+            
+        else:
+            patience_counter += 1
+            print(f"  ⏳ No improvement ({patience_counter}/{PATIENCE})")
+        
+        # Early Stopping
+        if patience_counter >= PATIENCE:
+            print(f"\n🛑 Early Stopping! Best performance: IoU {best_val_iou:.4f} (Epoch {best_epoch})")
+            break
+        
+        # Visualize prediction results every 5 epochs
+        if epoch % 5 == 0:
+            print(f"\n🖼️ Visualizing prediction results (Epoch {epoch})")
+            visualize_predictions(model, val_loader, device, num_samples=3)
+    
+    # 9. Final results after training completion
+    print(f"\n🎊 Training completed!")
+    print(f"  Best performance: IoU {best_val_iou:.4f} (Epoch {best_epoch})")
+    print(f"  Model saved at: best_segformer_robot_arm.pth")
+    
+    # 10. Final prediction result visualization
+    print(f"\n🖼️ Final prediction results")
+    visualize_predictions(model, val_loader, device, num_samples=5)
+    
+    # 11. Performance metrics summary
+    print_final_metrics(val_history, best_epoch)
+
+if __name__ == "__main__":
+    main()
