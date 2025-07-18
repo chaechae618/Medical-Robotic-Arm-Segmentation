@@ -1,0 +1,31 @@
+class CombinedLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3):
+        super().__init__()
+        self.alpha = alpha  # CrossEntropyLoss weight
+        self.beta = beta    # DiceLoss weight
+        self.ce_loss = nn.CrossEntropyLoss()
+        
+    def dice_loss(self, pred, target, smooth=1e-6):
+        """Dice Loss 계산"""
+        pred = torch.softmax(pred, dim=1)
+        
+        dice_losses = []
+        for cls in range(pred.shape[1]):
+            pred_cls = pred[:, cls, :, :]
+            target_cls = (target == cls).float()
+            
+            intersection = (pred_cls * target_cls).sum(dim=(1, 2))
+            union = pred_cls.sum(dim=(1, 2)) + target_cls.sum(dim=(1, 2))
+            
+            dice = (2.0 * intersection + smooth) / (union + smooth)
+            dice_loss = 1.0 - dice
+            dice_losses.append(dice_loss.mean())
+        
+        return sum(dice_losses) / len(dice_losses)
+    
+    def forward(self, pred, target):
+        ce_loss = self.ce_loss(pred, target)
+        dice_loss = self.dice_loss(pred, target)
+        
+        total_loss = self.alpha * ce_loss + self.beta * dice_loss
+        return total_loss, ce_loss, dice_loss
